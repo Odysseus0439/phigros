@@ -67,9 +67,9 @@ a{color:inherit;text-decoration:none;}
 
 /* ---------- 首屏 ---------- */
 .hero{padding:clamp(28px,5vw,58px) 0 clamp(24px,3.4vw,42px);}
-.hero .shell{display:grid;grid-template-columns:minmax(0,1.04fr) minmax(0,.96fr);gap:clamp(24px,4vw,56px);align-items:stretch;}
+.hero .shell{display:grid;grid-template-columns:minmax(0,1.04fr) minmax(0,.96fr);gap:clamp(24px,4vw,56px);align-items:start;}
 .hero-copy{display:flex;flex-direction:column;min-width:0;}
-.hero-meta{margin-top:auto;padding-top:22px;}
+.hero-meta{margin-top:26px;padding-top:0;}
 .hm-row{display:flex;gap:14px;padding:9px 0;border-top:1px solid var(--line-soft);font-size:11.5px;line-height:1.6;}
 .hm-k{width:56px;flex:0 0 auto;color:var(--dim);letter-spacing:.06em;}
 .hm-v{font-family:var(--mono);color:var(--muted);font-variant-numeric:tabular-nums;min-width:0;}
@@ -167,6 +167,10 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 .spinner{width:16px;height:16px;border:1.5px solid rgba(233,235,236,.2);border-top-color:var(--lime);border-radius:50%;animation:spin .8s linear infinite;}
 @keyframes spin{to{transform:rotate(360deg);}}
 .load-row{display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--muted);}
+.load-pct{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--lime);font-variant-numeric:tabular-nums;}
+.load-track{height:2px;background:rgba(233,235,236,.12);margin-top:12px;}
+.load-track i{display:block;height:100%;width:0;background:var(--lime);transition:width .12s linear;}
+.importer.busy .dropzone{display:none;} .importer.busy .imp-loading{padding-top:4px;}
 .imp-note{margin-top:12px;font-size:11px;line-height:1.7;color:var(--dim);}
 
 /* ---------- 曲库 ---------- */
@@ -402,7 +406,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
         </label>
 
         <div class="imp-loading" id="impLoading">
-          <div class="load-row"><span class="spinner" aria-hidden="true"></span><span id="impLoadingText">正在解码音频…</span></div>
+          <div class="load-row"><span class="spinner" aria-hidden="true"></span><span id="impLoadingText">正在解码音频…</span><b class="load-pct" id="impPct">0%</b></div>
+          <div class="load-track"><i id="impBar"></i></div>
         </div>
 
         <div class="imp-body" id="impBody">
@@ -429,7 +434,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       </div>
 
       <div class="pipeline">
-        <div class="pl-item"><span class="pl-n">01</span><div class="pl-txt"><b>解码分帧</b><span>AudioContext 解出 PCM，2048 点 STFT，每 512 采样一帧</span></div></div>
+        <div class="pl-item"><span class="pl-n">01</span><div class="pl-txt"><b>解码分帧</b><span>PCM 降采样到 11 kHz，512 点 STFT，每 128 采样一帧</span></div></div>
         <div class="pl-item"><span class="pl-n">02</span><div class="pl-txt"><b>谱通量峰值</b><span>相邻帧能量上升的位置，就是一次击打</span></div></div>
         <div class="pl-item"><span class="pl-n">03</span><div class="pl-txt"><b>节拍网格</b><span>自相关估 BPM，再逐相位对齐鼓点，音符吸附到网格</span></div></div>
         <div class="pl-item"><span class="pl-n">04</span><div class="pl-txt"><b>难度映射</b><span>音符密度、连打、按键类型按 1—15 档展开</span></div></div>
@@ -1033,12 +1038,33 @@ function makeFFT(n) {
 }
 
 async function analyzeBuffer(buffer, opts = {}) {
-  const sr = buffer.sampleRate;
-  const N = 2048, hop = 512;
-  const fps = sr / hop;
+  const onP = typeof opts.onProgress === 'function' ? opts.onProgress : function () { };
+  const SR = 11025;
+  const srcSr = buffer.sampleRate || 44100;
+  const step = Math.max(1, srcSr / SR);
   const ch0 = buffer.getChannelData(0);
   const ch1 = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : null;
-  const total = buffer.length;
+  const srcLen = buffer.length;
+  const total = Math.max(64, Math.floor(srcLen / step));
+
+  // 1) 降采样到 11 kHz：盒式平均，同时充当抗锯齿低通
+  onP(18, '降采样到 11 kHz…');
+  const mono = new Float32Array(total);
+  let lastY = performance.now();
+  for (let i = 0; i < total; i++) {
+    const s0 = Math.floor(i * step);
+    const s1 = Math.min(srcLen, Math.max(s0 + 1, Math.floor((i + 1) * step)));
+    let acc = 0;
+    for (let j = s0; j < s1; j++) acc += (ch0[j] + (ch1 ? ch1[j] : 0)) * 0.5;
+    mono[i] = acc / (s1 - s0);
+    if ((i & 8191) === 0 && performance.now() - lastY > 22) {
+      onP(18 + 8 * (i / total), '降采样到 11 kHz…'); await tick(); lastY = performance.now();
+    }
+  }
+
+  // 2) STFT：512 点窗（约 46 ms），每 128 采样一帧（约 11.6 ms）
+  const N = 512, hop = 128;
+  const fps = SR / hop;
   const frames = Math.max(1, Math.floor((total - N) / hop));
   const flux = new Float32Array(frames);
   const tilt = new Float32Array(frames);
@@ -1054,8 +1080,7 @@ async function analyzeBuffer(buffer, opts = {}) {
   for (let f = 0; f < frames; f++) {
     const off = f * hop;
     for (let i = 0; i < N; i++) {
-      const s = (ch0[off + i] + (ch1 ? ch1[off + i] : 0)) * 0.5 * win[i];
-      re[i] = s; im[i] = 0;
+      re[i] = mono[off + i] * win[i]; im[i] = 0;
     }
     fft(re, im);
     let fl = 0, low = 0, mid = 0, high = 0;
@@ -1066,31 +1091,46 @@ async function analyzeBuffer(buffer, opts = {}) {
       if (df > 0) fl += df;
       prev[k] = lm;
       const e = mag * mag;
-      const hz = k * sr / N;
+      const hz = k * SR / N;
       if (hz < 250) low += e;
       else if (hz < 2000) mid += e;
-      else if (hz < 9000) high += e;
+      else high += e;
     }
     flux[f] = fl;
     rms[f] = Math.sqrt(low + mid + high);
     tilt[f] = (high + mid * 0.55) / (low + mid + high + 1e-9);
-    if ((f & 511) === 0) await tick();
+    if ((f & 63) === 0 && performance.now() - lastY > 22) {
+      onP(26 + 54 * (f / frames), '逐帧分析谱通量…');
+      await tick();
+      lastY = performance.now();
+    }
   }
 
+  onP(82, '提取击打点…');
+  await tick();
   let gmax = 0;
   for (let i = 0; i < frames; i++) if (flux[i] > gmax) gmax = flux[i];
   const peaks = detectPeaks(flux, tilt, fps, gmax);
+
+  onP(90, '估计 BPM…');
+  await tick();
   const bpmInfo = estimateTempo(flux, fps, opts.knownBpm);
+  const fitPeaks = refineTempoFromPeaks(peaks, bpmInfo.bpm, bpmInfo.phase);
+
+  onP(96, '生成波形…');
+  await tick();
   const an = {
-    bpm: bpmInfo.bpm,
-    beat: 60 / bpmInfo.bpm,
-    phase: bpmInfo.phase,
+    bpm: fitPeaks.bpm,
+    beat: 60 / fitPeaks.bpm,
+    phase: fitPeaks.phase,
     duration: buffer.duration,
     peaks,
     fps,
+    sr: SR,
     firstOnset: peaks.length ? Math.max(0.2, peaks[0].t) : 0
   };
-  an.wave = waveOutline(buffer, 520);
+  an.wave = waveOutline(mono, 520);
+  onP(100, '分析完成');
   return an;
 }
 
@@ -1146,31 +1186,87 @@ function estimateTempo(flux, fps, known) {
 }
 
 function fitTempo(flux, fps, bpm0, span) {
-  let best = { bpm: bpm0, phase: 0, score: -1 };
   const n = flux.length;
-  for (let dB = -span; dB <= span + 0.001; dB += span / 12) {
-    const bpm = clamp(bpm0 + dB, 40, 260);
+  const dur = n / fps;
+  const scoreAt = (bpm, ph) => {
     const beat = 60 / bpm;
-    const stepT = beat / 64;
-    for (let ph = 0; ph < beat; ph += stepT) {
-      let s = 0, c = 0;
-      for (let t = ph; t < n / fps; t += beat) {
-        const idx = Math.round(t * fps);
-        if (idx >= 2 && idx < n - 2) {
-          const v = Math.max(flux[idx - 1], flux[idx], flux[idx + 1]);
-          s += v; c++;
-        }
+    let s = 0, c = 0;
+    for (let t = ph; t < dur; t += beat) {
+      const idx = Math.round(t * fps);
+      if (idx >= 2 && idx < n - 2) {
+        s += Math.max(flux[idx - 1], flux[idx], flux[idx + 1]);
+        c++;
       }
-      if (c < 4) continue;
-      const sc = s / c;
+    }
+    return c < 4 ? -1 : s / c;
+  };
+
+  let best = { bpm: bpm0, phase: 0, score: -1 };
+  const dBstep = (2 * span) / 11;            // 12 档 BPM
+  for (let i = 0; i < 12; i++) {
+    const bpm = clamp(bpm0 - span + dBstep * i, 40, 260);
+    const beat = 60 / bpm;
+    for (let p = 0; p < 16; p++) {           // 每拍 16 个相位
+      const ph = p * beat / 16;
+      const sc = scoreAt(bpm, ph);
       if (sc > best.score) best = { bpm, phase: ph, score: sc };
+    }
+  }
+
+  // 局部细化：BPM ±半个粗档 × 相位 ±1/32 拍，24 次
+  if (best.score >= 0) {
+    const b0 = best.bpm, ph0 = best.phase;
+    for (let i = -4; i <= 4; i++) {
+      if (!i) continue;
+      const bpm = clamp(b0 + (dBstep / 8) * i, 40, 260);
+      const beat = 60 / bpm;
+      for (let j = -1; j <= 1; j++) {
+        const ph = ph0 + j * beat / 32;
+        if (ph < 0) continue;
+        const sc = scoreAt(bpm, ph);
+        if (sc > best.score) best = { bpm, phase: ph, score: sc };
+      }
+    }
+    const beatF = 60 / best.bpm, basePh = best.phase;
+    for (let p = -4; p <= 4; p++) {          // 相位再微调 8 次
+      if (!p) continue;
+      const ph = basePh + p * beatF / 128;
+      if (ph < 0) continue;
+      const sc = scoreAt(best.bpm, ph);
+      if (sc > best.score) best = { bpm: best.bpm, phase: ph, score: sc };
     }
   }
   return best;
 }
 
+function refineTempoFromPeaks(peaks, bpm, phase) {
+  if (!peaks || peaks.length < 14) return { bpm, phase };
+  const beat = 60 / bpm;
+  const ks = [], ts = [];
+  for (let i = 0; i < peaks.length; i++) {
+    const p = peaks[i];
+    if (p.s < 0.1) continue;
+    const k = Math.round((p.t - phase) / beat);
+    if (Math.abs(p.t - (phase + k * beat)) > beat * 0.22) continue;
+    ks.push(k); ts.push(p.t);
+  }
+  if (ks.length < 12) return { bpm, phase };
+  let n = ks.length, sk = 0, st = 0, skk = 0, skt = 0;
+  for (let i = 0; i < n; i++) {
+    sk += ks[i]; st += ts[i]; skk += ks[i] * ks[i]; skt += ks[i] * ts[i];
+  }
+  const den = n * skk - sk * sk;
+  if (!den) return { bpm, phase };
+  const per = (n * skt - sk * st) / den;
+  if (!(per > 0.22 && per < 1.5)) return { bpm, phase };
+  const nb = 60 / per;
+  if (Math.abs(nb - bpm) / bpm > 0.06) return { bpm, phase };
+  const a = (st - per * sk) / n;
+  return { bpm: nb, phase: ((a % per) + per) % per };
+}
+
 function waveOutline(buffer, buckets) {
-  const ch = buffer.getChannelData(0);
+  const ch = buffer.getChannelData ? buffer.getChannelData(0) : buffer;
   const out = new Float32Array(buckets);
   const per = Math.max(1, Math.floor(ch.length / buckets));
   for (let b = 0; b < buckets; b++) {
@@ -2018,6 +2114,14 @@ $('#fileInput').addEventListener('change', e => {
   e.target.value = '';
 });
 
+function setImpProgress(pct, text) {
+  const p = clamp(Math.round(pct), 0, 100);
+  const pctEl = $('#impPct'), bar = $('#impBar');
+  if (pctEl) pctEl.textContent = p + '%';
+  if (bar) bar.style.width = p + '%';
+  if (text) $('#impLoadingText').textContent = text;
+}
+
 async function loadLocalFile(file) {
   if (!file) return;
   if (!/^audio\//.test(file.type) && !/\.(mp3|wav|m4a|ogg|flac|aac|webm)$/i.test(file.name)) {
@@ -2025,8 +2129,9 @@ async function loadLocalFile(file) {
     return;
   }
   $('#impBody').classList.remove('show');
+  $('#importer').classList.add('busy');
   $('#impLoading').classList.add('show');
-  $('#impLoadingText').textContent = '正在解码音频…';
+  setImpProgress(4, '正在解码音频…');
   $('#impFname').textContent = file.name;
   $('#impFdur').textContent = '—';
   $('#impOnsets').textContent = '—';
@@ -2035,9 +2140,9 @@ async function loadLocalFile(file) {
     cueAudio();
     const ab = await file.arrayBuffer();
     const buffer = await AC.decodeAudioData(ab);
-    $('#impLoadingText').textContent = '正在分析频谱（谱通量 / 节拍）…';
+    setImpProgress(16, '解码完成');
     await tick();
-    const an = await analyzeBuffer(buffer);
+    const an = await analyzeBuffer(buffer, { onProgress: setImpProgress });
     localAudio.buffer = buffer;
     localAudio.an = an;
     localAudio.name = file.name;
@@ -2046,12 +2151,14 @@ async function loadLocalFile(file) {
     $('#impOnsets').textContent = an.peaks.length;
     $('#bpmInput').value = Math.round(an.bpm);
     $('#impLoading').classList.remove('show');
+    $('#importer').classList.remove('busy');
     $('#impBody').classList.add('show');
     drawWave(an);
     updateEstimate();
   } catch (err) {
     console.error(err);
     $('#impLoading').classList.remove('show');
+    $('#importer').classList.remove('busy');
     toast('解码失败：浏览器不支持该编码，或文件损坏');
   }
 }
